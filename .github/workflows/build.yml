@@ -1,0 +1,560 @@
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "SpeedMacro"
+          include(":app")
+          EOF
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.speedmacro"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.speedmacro"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="Speed Macro" android:allowBackup="false">
+                  <service
+                      android:name=".MacroService"
+                      android:exported="false"
+                      android:label="Speed Macro"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p $(dirname app/src/main/res/xml/accessibility_service_config.xml)
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          EOF
+          mkdir -p $(dirname app/src/main/res/values/strings.xml)
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="service_desc">Быстрые свайпы камеры по кнопке</string>
+          </resources>
+          EOF
+          mkdir -p $(dirname app/src/main/java/com/example/speedmacro/MacroService.kt)
+          cat > app/src/main/java/com/example/speedmacro/MacroService.kt <<'EOF'
+          package com.example.speedmacro
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Context
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MacroService : AccessibilityService() {
+
+              // ===== НАСТРОЙКИ (меняй под себя) =====
+              // Камера: свайпы в правой половине экрана
+              private val startX = 0.60f     // где начинается свайп (доля ширины экрана)
+              private val swipeLen = 0.30f   // длина одного свайпа (доля ширины). Подбирай под 180°
+              private val yPos = 0.50f       // высота свайпа (доля высоты)
+              private val swipeMs = 30L      // длительность одного свайпа, мс
+              private val swipeStep = 40L    // шаг между свайпами, мс
+              private val swipes = 7         // сколько свайпов в одной порции
+              // Джойстик: макрос сам держит его вперёд
+              private val joyX = 0.12f       // где стоит джойстик (доля ширины)
+              private val joyY = 0.72f       // (доля высоты)
+              private val joyDrag = 0.12f    // насколько тянуть вверх (доля высоты)
+              // Прыжок: макрос сам держит кнопку прыжка
+              private val holdJump = true
+              private val jumpX = 0.90f      // где стоит кнопка прыжка (доля ширины)
+              private val jumpY = 0.75f      // (доля высоты)
+              // ======================================
+
+              private val handler = Handler(Looper.getMainLooper())
+              private lateinit var wm: WindowManager
+              private var holdBtn: Button? = null
+              private var editBtn: Button? = null
+              private var plusBtn: Button? = null
+              private var minusBtn: Button? = null
+              private var helpView: View? = null
+              private lateinit var holdLp: WindowManager.LayoutParams
+              private lateinit var editLp: WindowManager.LayoutParams
+              private var plusLp: WindowManager.LayoutParams? = null
+              private var minusLp: WindowManager.LayoutParams? = null
+              private var size = 240
+              private var running = false
+              private var editMode = false
+              private var wasRunning = false
+              private var gen = 0
+              private var okCnt = 0
+              private var cxCnt = 0
+              private var failCnt = 0
+              private var toRight = true
+              private var joy: GestureDescription.StrokeDescription? = null
+              private var jump: GestureDescription.StrokeDescription? = null
+
+              private var downX = 0f
+              private var downY = 0f
+              private var startMx = 0
+              private var startMy = 0
+
+              private var eDownX = 0f
+              private var eDownY = 0f
+              private var eStartX = 0
+              private var eStartY = 0
+              private var eMoved = false
+
+              private val helpText =
+                  "1. Find Blocky Puffiest Classic on the Marketplace or in the Avatar Creator catalog.\n\n" +
+                  "2. In your inventory open Body, scroll down a little, tap Full Body, find the right arm and equip it. It is not free: it costs 175 Robux.\n\n" +
+                  "3. You can make it better (not required): Atomical Blocky Legs, Atomical Blocky Left Arm and Beside Myself Torso. Equip the legs and the left arm. If you want, add the torso too, together with the Blocky Puffiest Classic right arm. The head is not needed.\n\n" +
+                  "4. Tap EDIT to move the START button, and use + and - to change its size.\n\n" +
+                  "5. Tap START. It walks forward, holds jump and spins the camera by itself. Touch the screen anywhere to stop it."
+
+              private val green = "#AA2E7D32"
+              private val red = "#AAC62828"
+              private val blue = "#AA1565C0"
+              private val gray = "#AA424242"
+
+              private val holdTouch = View.OnTouchListener { _, e ->
+                  if (editMode) {
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = e.rawX
+                              downY = e.rawY
+                              startMx = holdLp.x
+                              startMy = holdLp.y
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              holdLp.x = maxOf(0, startMx - (e.rawX - downX).toInt())
+                              holdLp.y = maxOf(0, startMy + (e.rawY - downY).toInt())
+                              holdBtn?.let { wm.updateViewLayout(it, holdLp) }
+                          }
+                          MotionEvent.ACTION_UP -> savePrefs()
+                      }
+                  } else {
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> wasRunning = running
+                          MotionEvent.ACTION_UP -> {
+                              if (wasRunning) stopMacro() else handler.postDelayed({ startMacro() }, 250)
+                          }
+                      }
+                  }
+                  true
+              }
+
+              private val editTouch = View.OnTouchListener { _, e ->
+                  when (e.action) {
+                      MotionEvent.ACTION_DOWN -> {
+                          eDownX = e.rawX
+                          eDownY = e.rawY
+                          eStartX = editLp.x
+                          eStartY = editLp.y
+                          eMoved = false
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          val dx = e.rawX - eDownX
+                          val dy = e.rawY - eDownY
+                          if (Math.abs(dx) > 15 || Math.abs(dy) > 15) eMoved = true
+                          if (eMoved) {
+                              editLp.x = maxOf(0, eStartX - dx.toInt())
+                              editLp.y = maxOf(0, eStartY + dy.toInt())
+                              editBtn?.let { wm.updateViewLayout(it, editLp) }
+                              layoutExtras()
+                          }
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          if (eMoved) savePrefs() else toggleEdit()
+                      }
+                  }
+                  true
+              }
+
+              private fun lp(w: Int, h: Int, g: Int, px: Int, py: Int): WindowManager.LayoutParams {
+                  val p = WindowManager.LayoutParams(
+                      w, h,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  p.gravity = g
+                  p.x = px
+                  p.y = py
+                  return p
+              }
+
+              private fun makeBtn(label: String, color: String, textSp: Float): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.textSize = textSp
+                  b.setTextColor(Color.WHITE)
+                  b.setBackgroundColor(Color.parseColor(color))
+                  return b
+              }
+
+              private fun setColor(b: Button?, color: String) {
+                  b?.setBackgroundColor(Color.parseColor(color))
+              }
+
+              private fun removeView(v: View?) {
+                  if (v != null) {
+                      try { wm.removeView(v) } catch (_: Exception) {}
+                  }
+              }
+
+              private fun showHelp() {
+                  if (helpView != null) return
+                  val d = resources.displayMetrics.density
+                  val pad = (14 * d).toInt()
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(Color.parseColor("#EE202020"))
+                  root.setPadding(pad, pad, pad, pad)
+
+                  val top = LinearLayout(this)
+                  top.orientation = LinearLayout.HORIZONTAL
+                  val title = TextView(this)
+                  title.text = "How to set up"
+                  title.textSize = 18f
+                  title.setTextColor(Color.WHITE)
+                  title.setTypeface(null, Typeface.BOLD)
+                  top.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  val xBtn = Button(this)
+                  xBtn.text = "X"
+                  xBtn.setTextColor(Color.WHITE)
+                  xBtn.setPadding(0, 0, 0, 0)
+                  xBtn.setBackgroundColor(Color.parseColor("#AAC62828"))
+                  xBtn.setOnClickListener { closeHelp() }
+                  val xs = (44 * d).toInt()
+                  top.addView(xBtn, LinearLayout.LayoutParams(xs, xs))
+                  root.addView(top)
+
+                  val body = TextView(this)
+                  body.text = helpText
+                  body.textSize = 14f
+                  body.setTextColor(Color.WHITE)
+                  body.setPadding(0, pad, 0, 0)
+                  root.addView(body)
+
+                  helpView = root
+                  wm.addView(root, lp((340 * d).toInt(), WindowManager.LayoutParams.WRAP_CONTENT, Gravity.CENTER, 0, 0))
+              }
+
+              private fun closeHelp() {
+                  removeView(helpView)
+                  helpView = null
+              }
+
+              private fun savePrefs() {
+                  getSharedPreferences("speedmacro", Context.MODE_PRIVATE).edit()
+                      .putInt("hx", holdLp.x)
+                      .putInt("hy", holdLp.y)
+                      .putInt("size", size)
+                      .putInt("ex", editLp.x)
+                      .putInt("ey", editLp.y)
+                      .apply()
+              }
+
+              override fun onServiceConnected() {
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  val prefs = getSharedPreferences("speedmacro", Context.MODE_PRIVATE)
+                  size = prefs.getInt("size", 240)
+                  holdLp = lp(size, size, Gravity.TOP or Gravity.END, prefs.getInt("hx", 330), prefs.getInt("hy", 200))
+                  editLp = lp(170, 110, Gravity.TOP or Gravity.END, prefs.getInt("ex", 20), prefs.getInt("ey", 200))
+
+                  val hb = makeBtn("START", green, 18f)
+                  hb.setOnTouchListener(holdTouch)
+                  holdBtn = hb
+                  wm.addView(hb, holdLp)
+
+                  val eb = makeBtn("EDIT", green, 14f)
+                  eb.setOnTouchListener(editTouch)
+                  editBtn = eb
+                  wm.addView(eb, editLp)
+
+                  showHelp()
+              }
+
+              private fun layoutExtras() {
+                  val pl = plusLp
+                  val ml = minusLp
+                  if (pl != null) {
+                      pl.x = editLp.x
+                      pl.y = editLp.y + 120
+                      plusBtn?.let { wm.updateViewLayout(it, pl) }
+                  }
+                  if (ml != null) {
+                      ml.x = editLp.x
+                      ml.y = editLp.y + 240
+                      minusBtn?.let { wm.updateViewLayout(it, ml) }
+                  }
+              }
+
+              private fun toggleEdit() {
+                  editMode = !editMode
+                  if (editMode) {
+                      stopMacro()
+                      setColor(holdBtn, blue)
+                      holdBtn?.textSize = 18f
+                      holdBtn?.text = "MOVE"
+                      setColor(editBtn, red)
+                      val pb = makeBtn("+", gray, 22f)
+                      pb.setOnClickListener { resize(30) }
+                      val mb = makeBtn("-", gray, 22f)
+                      mb.setOnClickListener { resize(-30) }
+                      val pl = lp(170, 110, Gravity.TOP or Gravity.END, editLp.x, editLp.y + 120)
+                      val ml = lp(170, 110, Gravity.TOP or Gravity.END, editLp.x, editLp.y + 240)
+                      plusBtn = pb
+                      minusBtn = mb
+                      plusLp = pl
+                      minusLp = ml
+                      wm.addView(pb, pl)
+                      wm.addView(mb, ml)
+                  } else {
+                      savePrefs()
+                      setColor(holdBtn, green)
+                      setColor(editBtn, green)
+                      refreshLabel()
+                      removeView(plusBtn)
+                      removeView(minusBtn)
+                      plusBtn = null
+                      minusBtn = null
+                      plusLp = null
+                      minusLp = null
+                  }
+              }
+
+              private fun resize(d: Int) {
+                  size = (size + d).coerceIn(120, 600)
+                  holdLp.width = size
+                  holdLp.height = size
+                  holdBtn?.let { wm.updateViewLayout(it, holdLp) }
+              }
+
+              private fun refreshLabel() {
+                  if (editMode) return
+                  val b = holdBtn ?: return
+                  if (running) {
+                      b.textSize = 11f
+                      b.text = "STOP\nOK " + okCnt
+                  } else if (okCnt + cxCnt + failCnt > 0) {
+                      b.textSize = 11f
+                      b.text = "START\nOK " + okCnt + "\nCX " + cxCnt + "\nF " + failCnt
+                  } else {
+                      b.textSize = 18f
+                      b.text = "START"
+                  }
+              }
+
+              private fun startMacro() {
+                  if (running || editMode) return
+                  running = true
+                  gen++
+                  okCnt = 0
+                  cxCnt = 0
+                  failCnt = 0
+                  joy = null
+                  jump = null
+                  toRight = true
+                  setColor(holdBtn, red)
+                  refreshLabel()
+                  chunk(gen)
+              }
+
+              private fun stopMacro() {
+                  running = false
+                  joy = null
+                  jump = null
+                  if (!editMode) {
+                      setColor(holdBtn, green)
+                      refreshLabel()
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun screen(): DisplayMetrics {
+                  val dm = DisplayMetrics()
+                  wm.defaultDisplay.getRealMetrics(dm)
+                  return dm
+              }
+
+              private fun chunk(id: Int) {
+                  if (!running || id != gen) return
+                  val dm = screen()
+                  val w = dm.widthPixels.toFloat()
+                  val h = dm.heightPixels.toFloat()
+                  val chunkMs = swipeStep * swipes
+                  val b = GestureDescription.Builder()
+
+                  // джойстик вперёд (держится между порциями)
+                  val jx = w * joyX
+                  val jy = h * joyY
+                  val jy2 = jy - h * joyDrag
+                  val pj = Path()
+                  val prevJoy = joy
+                  val js = if (prevJoy == null) {
+                      pj.moveTo(jx, jy)
+                      pj.lineTo(jx, jy2)
+                      GestureDescription.StrokeDescription(pj, 0, chunkMs, true)
+                  } else {
+                      pj.moveTo(jx, jy2)
+                      prevJoy.continueStroke(pj, 0, chunkMs, true)
+                  }
+                  joy = js
+                  b.addStroke(js)
+
+                  // кнопка прыжка (держится между порциями)
+                  if (holdJump) {
+                      val px = w * jumpX
+                      val py = h * jumpY
+                      val pp = Path()
+                      pp.moveTo(px, py)
+                      val prevJump = jump
+                      val jd = if (prevJump == null) {
+                          GestureDescription.StrokeDescription(pp, 0, chunkMs, true)
+                      } else {
+                          prevJump.continueStroke(pp, 0, chunkMs, true)
+                      }
+                      jump = jd
+                      b.addStroke(jd)
+                  }
+
+                  // свайпы камеры туда-обратно
+                  val x0 = w * startX
+                  val x1 = x0 + w * swipeLen
+                  val y = h * yPos
+                  for (i in 0 until swipes) {
+                      val pc = Path()
+                      if (toRight) {
+                          pc.moveTo(x0, y)
+                          pc.lineTo(x1, y)
+                      } else {
+                          pc.moveTo(x1, y)
+                          pc.lineTo(x0, y)
+                      }
+                      toRight = !toRight
+                      b.addStroke(GestureDescription.StrokeDescription(pc, i * swipeStep, swipeMs))
+                  }
+
+                  val ok = dispatchGesture(b.build(), object : GestureResultCallback() {
+                      override fun onCompleted(d: GestureDescription?) {
+                          if (running && id == gen) {
+                              okCnt++
+                              refreshLabel()
+                              chunk(id)
+                          }
+                      }
+                      override fun onCancelled(d: GestureDescription?) {
+                          if (running && id == gen) {
+                              cxCnt++
+                              stopMacro()
+                          }
+                      }
+                  }, null)
+                  if (!ok) {
+                      failCnt++
+                      stopMacro()
+                  }
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() { stopMacro() }
+
+              override fun onDestroy() {
+                  running = false
+                  removeView(holdBtn)
+                  removeView(editBtn)
+                  removeView(plusBtn)
+                  removeView(minusBtn)
+                  removeView(helpView)
+                  super.onDestroy()
+              }
+          }
+          EOF
+      - name: Build APK
+        run: |
+          if [ -n "$JAVA_HOME_17_X64" ]; then
+            export JAVA_HOME="$JAVA_HOME_17_X64"
+            export PATH="$JAVA_HOME/bin:$PATH"
+          fi
+          java -version
+          ok=0
+          for url in \
+            https://mirrors.cloud.tencent.com/gradle/gradle-8.7-bin.zip \
+            https://repo.huaweicloud.com/gradle/gradle-8.7-bin.zip \
+            https://services.gradle.org/distributions/gradle-8.7-bin.zip \
+            https://downloads.gradle.org/distributions/gradle-8.7-bin.zip
+          do
+            echo "Trying $url"
+            rm -f gradle.zip
+            if curl -fsSL --retry 2 --retry-delay 3 --retry-all-errors -o gradle.zip "$url" && unzip -tq gradle.zip > /dev/null 2>&1; then
+              ok=1
+              break
+            fi
+          done
+          if [ "$ok" = "1" ]; then
+            unzip -q gradle.zip -d "$HOME"
+            G="$HOME/gradle-8.7/bin/gradle"
+          else
+            echo "Download failed, using Gradle installed on the runner"
+            gradle --version
+            G=gradle
+          fi
+          "$G" assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SpeedMacro-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
